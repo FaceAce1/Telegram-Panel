@@ -22,12 +22,16 @@ public static class ModuleBootstrapper
         services.AddSingleton(layout);
         services.AddSingleton(new ModuleHostContext(hostVersion, layout.Root));
         services.AddSingleton<ModuleStateStore>();
+        services.AddSingleton<ModuleRepositoryStore>();
+        services.AddSingleton<ModuleRepositoryTransport>();
+        services.AddSingleton<ModuleRepositoryService>();
         services.AddSingleton(builtInCatalog);
         services.AddSingleton(sp => new ModuleInstallerService(
             sp.GetRequiredService<ModuleLayout>(),
             sp.GetRequiredService<ModuleStateStore>(),
             sp.GetRequiredService<BuiltInModuleCatalog>(),
-            hostVersion));
+            hostVersion,
+            sp.GetRequiredService<ModuleRegistry>()));
 
         // 在 DI 构建前加载模块清单并执行 ConfigureServices
         var registry = new ModuleRegistry();
@@ -142,7 +146,8 @@ public static class ModuleBootstrapper
         // 贡献注册表（任务/API/UI 元数据）：启动时固化一次，启用/停用通常需要重启
         services.AddSingleton(sp => new ModuleContributionRegistry(
             sp.GetRequiredService<ModuleRegistry>(),
-            sp.GetRequiredService<ILogger<ModuleContributionRegistry>>()));
+            sp.GetRequiredService<ILogger<ModuleContributionRegistry>>(),
+            sp));
     }
 
     private static void TryConfigureAndRegister(
@@ -159,7 +164,7 @@ public static class ModuleBootstrapper
     {
         try
         {
-            module.ConfigureServices(services, context);
+            ConfigureServicesAtomically(module, services, context);
         }
         catch (Exception ex)
         {
@@ -170,9 +175,31 @@ public static class ModuleBootstrapper
         registry.Add(new LoadedModule(id, version, builtIn, module, context, manifest, moduleRootPath));
     }
 
-    private static void EnsureBuiltInModules(ModuleState state, BuiltInModuleCatalog builtInCatalog, string hostVersion)
+    internal static void ConfigureServicesAtomically(
+        ITelegramPanelModule module,
+        IServiceCollection services,
+        ModuleHostContext context)
+    {
+        var serviceSnapshot = services.ToArray();
+        try
+        {
+            module.ConfigureServices(services, context);
+        }
+        catch
+        {
+            services.Clear();
+            foreach (var descriptor in serviceSnapshot)
+                services.Add(descriptor);
+            throw;
+        }
+    }
+
+    internal static void EnsureBuiltInModules(ModuleState state, BuiltInModuleCatalog builtInCatalog, string hostVersion)
     {
         state.Modules ??= new List<ModuleStateItem>();
+
+        // 踢人能力已迁至可安装演示模块。旧内置项只有宿主版本元数据，移除时不触碰 API 配置和任务。
+        state.Modules.RemoveAll(item => item.BuiltIn && item.Id == "builtin.kick-api");
 
         foreach (var manifest in builtInCatalog.CreateModules().Select(m => m.Manifest))
         {

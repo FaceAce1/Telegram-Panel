@@ -1,0 +1,160 @@
+# 安装部署
+
+本文档用于把 Telegram Panel 跑起来（推荐 Docker 远程镜像）。
+
+## 安装在线模块
+
+在包含在线仓库功能的版本中，打开「模块管理」，选择官方仓库并点击「连接 / 刷新目录」。
+也可添加自己的 GitHub 仓库（`owner/repo` 与分支）或公网 HTTPS `index.json`；私有仓库填写只读令牌。
+官方目录提供“演示模块：外部 API 踢人/封禁”。从宿主 1.31.77 的外置改动起，需安装该模块才能使用踢人 API；
+旧 API 配置和密钥保留，升级前先排空或暂停/取消旧踢人任务。模块包不兼容仍内置此功能的旧宿主。
+确认来源可信后安装所选版本，按页面选项自动或手动重启，再验证模块页面和业务功能。
+
+「一键清理旧版本」会先展示待删除清单，保留当前、最后可用及仍在运行的版本。
+清理永久删除旧安装文件和安装包，没有回收站；删除前确认备份。
+若需要回滚已清理版本，必须重新下载或从备份恢复。令牌需与 DataProtection 密钥一起备份。
+个人仓库发布、私有权限、故障排查及验收步骤见[在线模块仓库维护](../developer/module-repositories.md)。
+在模块管理页点击“Fork 创建个人仓库”可从官方公开示例开始修改；完成构建、发布和目录更新后，
+点击“添加仓库”填入自己的 `owner/repo`，私有仓库同时填写只读令牌。
+
+## Docker 部署（推荐）
+
+### 环境要求
+
+- Docker（Windows 推荐 Docker Desktop + WSL2；Linux 直接安装 Docker Engine）
+
+### 第一步：准备项目
+
+```bash
+git clone https://github.com/moeacgx/Telegram-Panel
+cd Telegram-Panel
+cp .env.example .env
+```
+
+### 第二步：选择镜像版本
+
+默认是稳定版（无需改动）：
+
+```bash
+TP_IMAGE=ghcr.io/moeacgx/telegram-panel:latest
+```
+
+如果你要开发版，把 `.env` 里的 `TP_IMAGE` 改成：
+
+```bash
+TP_IMAGE=ghcr.io/moeacgx/telegram-panel:dev-latest
+```
+
+### 第三步：启动
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+启动后访问：`http://localhost:5000`
+
+### 默认后台账号（首次登录）
+
+- 用户名：`tgpanel`
+- 密码：首次启动在持久化凭据目录生成 `admin-bootstrap-password.txt`，仅在服务器本地读取。
+
+v1.31.87 起不再使用通用默认口令。Docker 默认文件为宿主机 `docker-data/admin-bootstrap-password.txt`；
+桌面版位于用户持久化数据目录，与 `admin_auth.json` 同目录。勿把该文件发给他人或放进网站目录。
+首次登录必须修改为至少 12 位且不同于旧密码的新密码，完成后文件自动清理。
+可通过 `AdminAuth__InitialPassword` 显式设置安全初始口令；已有管理员凭据不被配置覆盖。
+历史尚未改密且仍使用 `tgpanel123` 的实例升级后会旋转为随机口令，读取上述文件登录。
+升级后旧浏览器会话失效，需要重新登录；详情见[认证安全](../developer/admin-auth-security.md)。
+
+### 可选配置：自定义 Telegram API 凭据
+
+面板内置 Telegram 官方 Android API（ApiId `6`），系统设置里的 Telegram API 池默认把它放在最顶上并启用；不需要手工填写官方 API Hash。
+
+如果需要自建 API、隔离额度或分散新账号，可到 https://my.telegram.org/apps 用任意一个 Telegram 账号申请 `api_id` / `api_hash`，然后在面板「系统设置」的 Telegram API 区块添加到 API 池。`api_hash` 是 **32 位十六进制字符串（0-9a-f）**，请不要填 Token/用户名/URL 等其它值。
+
+### 导入或登录前先选择账号出口
+
+导入账号、手机号登录和二维码登录会在第一条 Telegram 请求前要求选择代理出口、自动分配
+空闲轻量 WARP、创建一对一轻量 WARP、有效的全局代理或明确直连。登录、导入和账号绑定创建
+一对一轻量 WARP 时必须显式接受条款并通过出口检测。系统不会先用面板公网 IP 登录，再补绑代理。
+
+普通 HTTP、SOCKS5、MTProxy 和 Resin 可直接在 **代理管理** 中添加。“一键创建 WARP”
+使用 Linux 镜像内置 wgcf＋wireproxy，无需额外 Compose 文件、Docker Socket 或每出口容器；出口名称
+可留空自动生成，一键创建入口会使用已接受的 WARP 条款。
+v1.31.82 起所有轻量出口与普通代理显示在同一列表，旧容器 WARP 已退役；旧安装必须先完成
+[升级前迁移](../deployment/wgcf-wireproxy.md)。完整使用说明见
+[代理管理与账号出口](../guides/proxy-management.md)。
+
+v1.31.83 支持显式将同一轻量出口绑定给多个账号，或设为全局代理；自动空闲池仍按
+无账号、无全局占用的规则独占领取。轻量代理支持多选分类、单个及批量删除；使用中的出口须先
+迁走账号并解除全局引用。回滚 v1.31.82 前先迁回其支持的路由，详见上述部署文档。
+
+### 数据持久化（别乱删）
+
+容器内所有持久化数据统一挂载到宿主机 `./docker-data`：
+
+- 数据库：`./docker-data/telegram-panel.db`
+- Sessions：`./docker-data/sessions/`
+- 系统设置本地覆盖：`./docker-data/appsettings.local.json`
+- 后台登录凭据文件：`./docker-data/admin_auth.json`
+- 图片资产：`./docker-data/uploads/`
+
+更多说明见：[配置与数据目录](../reference/configuration.md)。
+
+### 常用命令
+
+```bash
+# 查看日志
+docker compose logs -f
+
+# 更新到当前 .env 指定的镜像版本
+docker compose pull
+docker compose up -d
+
+# 重启 / 停止
+docker compose restart
+docker compose down
+```
+
+## 生产部署入口
+
+- 反向代理（含 WebSocket）：见 [反向代理](../deployment/reverse-proxy.md)
+- Bot Webhook（可选，生产推荐）：见 [Bot Webhook](../deployment/bot-webhook.md)
+
+## 更新与常见问题
+
+- 更新升级：见 [更新升级](update.md)
+- 常见问题：见 [常见问题](faq.md)
+- 如果出现“镜像已更新但页面还是旧版”，请看 [更新升级](update.md) 里的
+  「常见现象：镜像更新了，页面还是旧版」与「远程镜像 与 本地构建：如何切换」。
+
+## 下一步
+
+账号详情会直接展示当前保存的二级密码（适用于 v1.31.78 及后续版本）。
+通过面板更换登录邮箱并确认验证码后，完整地址会保存到本地；之后查询到的官方掩码与记录一致时，
+详情展示完整地址。仅发送验证码的目标地址仍是待确认状态，不会替换当前邮箱。
+只有官方掩码明显不匹配或明确无邮箱时，旧记录才失效；查询失败或官方掩码为空时保留历史完整地址，
+并标记“未核验”。若验证码已确认，但首次读取官方掩码失败，完整地址仍会保存为未核验，后续查询
+不会自动补建确认时缺失的核验基线。掩码一致也无法区分恰好具有相同掩码的不同邮箱。
+旧账号没有完整地址记录时仍显示 Telegram 掩码，无法从星号还原。手动、批量和计划任务均遵循同一规则。
+升级前备份数据库并确认 `20261009000000_AddAccountLoginEmails` 迁移完成；验收时检查确认成功后
+刷新详情能看到完整地址和对应核验状态。若需回滚，恢复旧程序即可停用新增展示；不要手动删除
+`AccountLoginEmails` 表或迁移历史。详细核验和迁移回滚约束见
+[账号详情密码与登录邮箱合同](../developer/documentation.md)。
+
+自 v1.31.78起，在“账号分类”页创建和维护分类、查看账号数量；
+在“账号列表”页查看具体账号、筛选分类成员和批量调整归属。操作和排查步骤见
+[账号导入指南](../guides/account-import.md)中的“导入时选择分类”一节。
+
+- 账号导入：见 [账号导入（Zip / TData）](../guides/account-import.md)
+- 新号必看：见 [防冻结指南](../guides/anti-freeze.md)
+- 列表/批量能力依赖同步：见 [同步说明](../guides/sync.md)
+
+## 本地开发运行（可选）
+
+```bash
+corepack enable
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend run build
+dotnet run --project src/TelegramPanel.Web
+```

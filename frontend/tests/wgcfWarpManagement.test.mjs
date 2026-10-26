@@ -1,0 +1,238 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import test from 'node:test'
+import ts from 'typescript'
+import { computed, reactive, ref } from 'vue'
+
+const utility = await readFile(new URL('../src/utils/requestId.ts', import.meta.url), 'utf8')
+const moduleCode = ts.transpileModule(utility, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText
+const { createRequestId } = await import(`data:text/javascript;base64,${Buffer.from(moduleCode).toString('base64')}`)
+
+const component = await readFile(new URL('../src/components/WgcfWarpPanel.vue', import.meta.url), 'utf8').catch(() => '')
+const proxiesSource = await readFile(new URL('../src/views/Proxies.vue', import.meta.url), 'utf8')
+
+function setup(overrides = {}, browserCrypto = { randomUUID: () => '0efca5bd-b7b0-4a77-92b7-112c686ef591' }) {
+  assert.ok(component, '轻量 WARP 管理组件尚未实现')
+  const script = component.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(script, '管理组件缺少脚本')
+  const messages = []
+  const events = []
+  const api = {
+    wgcfStatus: async () => ({ available: true, reason: null, profiles: [] }),
+    accounts: async () => ({ items: [], total: 0 }),
+    ...overrides,
+  }
+  const js = ts.transpileModule(script.replace(/^import[\s\S]*?from ['"][^'"]+['"]\s*$/gm, ''), {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 },
+  }).outputText.replace(/export \{\};?/, '')
+  const factory = new Function('ref', 'reactive', 'computed', 'onMounted', 'onBeforeUnmount', 'defineEmits', 'panelApi', 'ElMessage', 'crypto', 'defineExpose', 'createRequestId',
+    `${js}\nreturn {status, createDialog, bindDialog, profiles, busyProfiles, openCreate, createProfile, operate, canBind, openBind, bindAccount, loadStatus};`)
+  const state = factory(ref, reactive, computed, () => {}, () => {}, () => (...args) => events.push(args), api,
+    Object.fromEntries(['success', 'warning', 'error'].map((type) => [type, (message) => messages.push({ type, message })])),
+    browserCrypto, () => {}, () => createRequestId(browserCrypto))
+  state.status.value = { available: true, reason: null, profiles: [] }
+  return { ...state, messages, events }
+}
+
+function profile(values = {}) {
+  return { profile: 'wgcf-one', name: '测试出口', phase: 'ready', registered: true, generated: true,
+    desired: true, runtime: 'listening', proxyId: 17, accountCount: 0, shareEligible: true, usageCount: 0, isGlobal: false, testStatus: 'ok', egressIp: '1.2.3.4', error: null, ...values }
+}
+
+test('环境不可用时禁止打开创建并且不提交注册', async () => {
+  let calls = 0
+  const state = setup({ createWgcfProfile: async () => { calls++; return profile() } })
+  state.status.value.available = false
+  state.openCreate()
+  assert.equal(state.createDialog.visible, false)
+  await state.createProfile()
+  assert.equal(calls, 0)
+})
+
+test('不填写出口名称也可以创建并自动提交已接受条款', async () => {
+  let calls = 0
+  const requests = []
+  const state = setup({ createWgcfProfile: async (payload) => { calls++; requests.push(payload); return profile() } })
+  state.openCreate()
+  await state.createProfile()
+  assert.equal(calls, 1)
+  assert.deepEqual(requests, [{ name: '', acceptTerms: true, requestId: '0efca5bd-b7b0-4a77-92b7-112c686ef591' }])
+  assert.equal(state.createDialog.visible, false)
+})
+
+test('请求超时后重试保持同一 requestId，成功后显示后台创建', async () => {
+  const requests = []
+  const state = setup({ createWgcfProfile: async (payload) => {
+    requests.push(payload)
+    if (requests.length === 1) throw new Error('timeout')
+    return profile({ phase: 'creating', proxyId: null })
+  } })
+  state.openCreate()
+  state.createDialog.name = ' 出口 '
+  await state.createProfile()
+  assert.equal(state.createDialog.visible, true)
+  await state.createProfile()
+  assert.deepEqual(requests, [
+    { name: '出口', acceptTerms: true, requestId: '0efca5bd-b7b0-4a77-92b7-112c686ef591' },
+    { name: '出口', acceptTerms: true, requestId: '0efca5bd-b7b0-4a77-92b7-112c686ef591' },
+  ])
+  assert.equal(state.createDialog.visible, false)
+  assert.equal(state.profiles.value[0].phase, 'creating')
+})
+
+test('失败档案重试继续原档案而不重新注册', async () => {
+  const calls = []
+  const state = setup({ resumeWgcfProfile: async (id) => { calls.push(id); return profile({ phase: 'creating' }) } })
+  await state.operate(profile({ phase: 'failed' }), 'resume')
+  assert.deepEqual(calls, ['wgcf-one'])
+})
+
+test('只有联网检测成功且运行中的出口允许绑定', () => {
+  const state = setup()
+  assert.equal(state.canBind(profile()), true)
+  assert.equal(state.canBind(profile({ accountCount: 2, isGlobal: true })), true)
+  for (const changes of [{ testStatus: 'failed' }, { egressIp: null }, { desired: false }, { runtime: 'unknown' }, { proxyId: null }, { phase: 'creating' }, { shareEligible: false }]) {
+    assert.equal(state.canBind(profile(changes)), false)
+  }
+})
+
+test('绑定失败保留对话框且不误报成功', async () => {
+  const state = setup({ setAccountProxy: async () => ({ success: 0, failed: 1, items: [{ accountId: 123, success: false, error: '冲突', summary: '' }] }) })
+  state.openBind(profile())
+  state.bindDialog.accountId = 123
+  state.bindDialog.accounts = [{ id: 123, proxy: { id: 9 }, useGlobalProxy: false, nickname: '账号', displayPhone: '123' }]
+  await state.bindAccount()
+  assert.equal(state.bindDialog.visible, true)
+  assert.equal(state.messages.some((item) => item.type === 'success'), false)
+})
+
+test('单账号绑定携带当前代理编号并只绑定明确选择的账号', async () => {
+  let received
+  const state = setup({ setAccountProxy: async (...args) => { received = args; return { success: 1, failed: 0, items: [{ accountId: 123, success: true, summary: '已绑定' }] } } })
+  state.openBind(profile())
+  state.bindDialog.accountId = 123
+  state.bindDialog.accounts = [{ id: 123, proxy: { id: 9 }, useGlobalProxy: false, nickname: '账号', displayPhone: '123' }]
+  await state.bindAccount()
+  assert.deepEqual(received, [123, { strategy: 'existing', proxyId: 17, expectedProxyId: 9, expectedUseGlobalProxy: false }])
+  assert.equal(state.bindDialog.visible, false)
+})
+
+test('有绑定账号的档案禁止停止', async () => {
+  let calls = 0
+  const state = setup({ stopWgcfProfile: async () => { calls++; return profile() } })
+  await state.operate(profile({ accountCount: 1 }), 'stop')
+  await state.operate(profile({ isGlobal: true }), 'stop')
+  await state.operate(profile({ usageCount: 5 }), 'stop')
+  assert.equal(calls, 0)
+})
+
+test('同一档案的操作不会重复提交', async () => {
+  let calls = 0
+  let finish
+  const state = setup({ testWgcfProfile: () => { calls++; return new Promise((resolve) => { finish = resolve }) } })
+  const pending = state.operate(profile(), 'test')
+  await state.operate(profile(), 'test')
+  assert.equal(calls, 1)
+  finish(profile())
+  await pending
+  assert.equal(state.busyProfiles.has('wgcf-one'), false)
+})
+
+test('状态不允许的启动、恢复与检测不提交请求', async () => {
+  let calls = 0
+  const api = async () => { calls++; return profile() }
+  const state = setup({ startWgcfProfile: api, resumeWgcfProfile: api, testWgcfProfile: api })
+  await state.operate(profile(), 'start')
+  await state.operate(profile(), 'resume')
+  await state.operate(profile({ runtime: 'stopped' }), 'test')
+  await state.operate(profile({ desired: false, generated: false }), 'start')
+  assert.equal(calls, 0)
+})
+
+test('操作结果通过状态事件传递到统一列表，旧轮询不能抹掉新档案', async () => {
+  let completePoll
+  const state = setup({
+    wgcfStatus: () => new Promise((resolve) => { completePoll = resolve }),
+    createWgcfProfile: async () => profile({ phase: 'creating', proxyId: null }),
+  })
+  const polling = state.loadStatus()
+  state.openCreate()
+  state.createDialog.name = '新出口'
+  await state.createProfile()
+  const event = state.events.find(([name]) => name === 'state')
+  assert.equal(event[1].profiles[0].profile, 'wgcf-one')
+  completePoll({ available: true, reason: null, profiles: [] })
+  await polling
+  assert.equal(state.profiles.value.length, 1)
+})
+
+test('已持久化的同一请求也会关闭创建对话框', async () => {
+  const state = setup({ createWgcfProfile: async () => profile() })
+  state.openCreate()
+  state.createDialog.name = '出口'
+  await state.createProfile()
+  assert.equal(state.createDialog.visible, false)
+  assert.equal(state.createDialog.running, false)
+})
+
+test('创建响应早于首次状态读取时仍会收口对话框', async () => {
+  let complete
+  const state = setup({ createWgcfProfile: () => new Promise((resolve) => { complete = resolve }) })
+  state.openCreate()
+  state.createDialog.name = '出口'
+  const pending = state.createProfile()
+  // 模拟请求已经发出后，首轮状态读取尚未落地的窗口。
+  state.status.value = null
+  complete(profile())
+  await pending
+  assert.equal(state.createDialog.visible, false)
+  assert.equal(state.profiles.value[0].profile, 'wgcf-one')
+})
+
+test('创建或操作结果替换状态档案，而不写入只读派生列表', () => {
+  assert.match(component, /const current = status\.value \?\? \{ available: true, reason: null, profiles: \[\] \}/)
+  assert.match(component, /status\.value = \{[\s\S]*?profiles: \[\.\.\.current\.profiles\.filter/)
+  assert.doesNotMatch(component, /status\.value\.profiles\s*=/)
+})
+
+test('受管轻量出口可多选，包括尚未落库档案', () => {
+  const match = proxiesSource.match(/function isSelectableProxy\([^)]*\) \{[\s\S]*?\n\}/)
+  assert.ok(match, '缺少受管出口批量操作保护')
+  const js = ts.transpileModule(`${match[0]}\nexport { isSelectableProxy }`, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText
+  const selectable = new Function(`${js.replace(/export \{.*?\};/, '')}\nreturn isSelectableProxy`)()
+  assert.equal(selectable({ id: 1, kind: 'wireguard_warp', managedWgcfProfile: 'wgcf-one' }), true)
+  assert.equal(selectable({ id: 0, kind: 'wireguard_warp', managedWgcfProfile: 'wgcf-failed' }), true)
+  assert.equal(selectable({ id: 2, kind: 'manual', managedWgcfProfile: null }), true)
+})
+
+for (const view of ['AccountLogin', 'AccountImport']) {
+  test(`${view} 已有代理选项支持共享资格筛选，排除旧容器`, async () => {
+    const source = await readFile(new URL(`../src/views/${view}.vue`, import.meta.url), 'utf8')
+    const selection = source.match(/const selectableProxies = computed\([^]*?\n/)[0]
+    const js = ts.transpileModule(selection, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText
+    const utility = await readFile(new URL('../src/utils/proxyRows.ts', import.meta.url), 'utf8')
+    const compiled = ts.transpileModule(utility, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText
+    const { canShareProxy } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+    const proxies = ref([{ id: 17, isEnabled: true, kind: 'wireguard_warp', managedWgcfProfile: 'wgcf-one' }, { id: 2, isEnabled: true, kind: 'manual' }, { id: 3, kind: 'warp' }])
+    const warpStatus = ref({ available: true, profiles: [profile({ accountCount: 2 })] })
+    const selectable = new Function('proxies', 'computed', 'canShareProxy', 'warpStatus', `${js}\nreturn selectableProxies`)(proxies, computed, canShareProxy, warpStatus)
+    assert.deepEqual(selectable.value.map((proxy) => proxy.id), [17, 2])
+    assert.match(source, /v-for="proxy in selectableProxies"/)
+  })
+}
+
+test('HTTP 环境没有 randomUUID 仍能打开创建并在超时重试时复用请求编号', async () => {
+  const requests = []
+  const state = setup({ createWgcfProfile: async (payload) => {
+    requests.push(payload)
+    if (requests.length === 1) throw new Error('timeout')
+    return profile()
+  } }, { getRandomValues: (bytes) => { bytes.set(Array.from({ length: 16 }, (_, i) => i)); return bytes } })
+  state.openCreate()
+  assert.equal(state.createDialog.visible, true)
+  assert.match(state.createDialog.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  await state.createProfile()
+  await state.createProfile()
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0].requestId, requests[1].requestId)
+})

@@ -25,15 +25,15 @@
             else
             {
                 <MudText Typo="Typo.subtitle2">
-                    执行账号：@account.Phone @(string.IsNullOrWhiteSpace(account.Nickname) ? "" : $"（{account.Nickname}）")
+                    执行账号：@account.DisplayPhone @(string.IsNullOrWhiteSpace(account.Nickname) ? "" : $"（{account.Nickname}）")
                 </MudText>
             }
 
             <MudTextField @bind-Value="linksText" Label="频道/群链接列表（换行分隔）" Variant="Variant.Outlined" Lines="8"
                           HelperText="每行一个链接或用户名；提交后将创建后台任务执行。" />
 
-            <MudNumericField @bind-Value="delayMs" Label="操作间隔（毫秒）" Variant="Variant.Outlined" Min="0" Max="10000"
-                             HelperText="建议设置 1500-4000ms，避免触发风控（会额外加少量随机抖动）。" />
+            <MudNumericField @bind-Value="delayMs" Label="操作间隔（毫秒）" Variant="Variant.Outlined" Min="0" Max="60000"
+                             HelperText="建议设置 1500-4000ms；最高 60000ms，账号风控较高时可调大。" />
         </MudStack>
     </DialogContent>
     <DialogActions>
@@ -103,7 +103,7 @@
 
         bool? confirm = await DialogService.ShowMessageBox(
             "确认执行",
-            $"将使用账号 {account.Phone} 对 {links.Count} 个链接执行订阅/加群操作。是否继续？",
+            $"将使用账号 {account.DisplayPhone} 对 {links.Count} 个链接执行订阅/加群操作。是否继续？",
             yesText: "继续", cancelText: "取消");
 
         if (confirm != true)

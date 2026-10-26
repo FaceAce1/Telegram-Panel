@@ -1,0 +1,166 @@
+/* 移动端自适应增强：避免按钮文字被挤成“竖排” */
+
+#blazor-error-ui {
+  display: none;
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 10000;
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: 1px solid #f5c2c7;
+  border-radius: 6px;
+  background: #f8d7da;
+  color: #842029;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.2);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+#blazor-error-ui button {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px solid rgba(132, 32, 41, 0.35);
+  border-radius: 4px;
+  background: #fff;
+  color: #842029;
+  cursor: pointer;
+}
+
+#components-reconnect-modal {
+  display: none;
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  z-index: 9999;
+  transform: translateX(-50%);
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border: 1px solid rgba(25, 118, 210, 0.28);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2937;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.2);
+  font-size: 14px;
+}
+
+#components-reconnect-modal.components-reconnect-show,
+#components-reconnect-modal.components-reconnect-failed,
+#components-reconnect-modal.components-reconnect-rejected {
+  display: block;
+}
+
+#components-reconnect-modal > div {
+  display: none;
+}
+
+#components-reconnect-modal.components-reconnect-show .components-reconnect-show,
+#components-reconnect-modal.components-reconnect-failed .components-reconnect-failed,
+#components-reconnect-modal.components-reconnect-rejected .components-reconnect-rejected {
+  display: block;
+}
+
+#components-reconnect-modal button {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px solid #d8dee8;
+  border-radius: 4px;
+  background: #f7f9fc;
+  color: #1f2937;
+  cursor: pointer;
+}
+
+.tp-flex-wrap {
+  flex-wrap: wrap !important;
+}
+
+.tp-nowrap {
+  white-space: nowrap !important;
+}
+
+.tp-only-xs {
+  display: none;
+}
+
+.tp-actions-inline {
+  display: inline-flex;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+.tp-actions-menu {
+  display: none;
+}
+
+.tp-toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.tp-toolbar-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tp-toolbar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+@media (max-width: 600px) {
+  /* MudStack 在小屏下允许换行，优先换行而不是压缩到极窄导致逐字换行 */
+  .mud-stack-root.tp-flex-wrap {
+    row-gap: 8px;
+  }
+
+  /* 输入框在小屏更容易占满一行 */
+  .tp-input-full-xs {
+    flex: 1 1 100% !important;
+    min-width: 100% !important;
+  }
+
+  .tp-hide-xs {
+    display: none !important;
+  }
+
+  .tp-only-xs {
+    display: inherit !important;
+  }
+
+  /* 小屏把行内操作收纳成菜单，避免一堆图标挤在一行 */
+  .tp-actions-inline {
+    display: none !important;
+  }
+
+  .tp-actions-menu {
+    display: inline-flex !important;
+  }
+
+  .tp-page-title {
+    font-size: 1.6rem !important;
+    line-height: 1.2 !important;
+  }
+
+  .tp-toolbar-row {
+    justify-content: flex-start;
+  }
+
+  .tp-toolbar-right {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  /* 避免某些布局下工具栏“吸顶”遮挡页面标题 */
+  .tp-table .mud-table-toolbar {
+    position: static !important;
+    top: auto !important;
+  }
+}

@@ -19,6 +19,8 @@
                 <MudTextField @bind-Value="newCategoryName" Label="分类名称" Variant="Variant.Outlined" />
                 <MudColorPicker @bind-Value="newCategoryColor" Label="分类颜色" Class="mt-3" />
                 <MudTextField @bind-Value="newCategoryDesc" Label="描述" Variant="Variant.Outlined" Lines="3" Class="mt-3" />
+                <MudSwitch @bind-Value="newCategoryExcludeFromOperations" Color="Color.Primary" Class="mt-3"
+                           Label="排除操作（不出现在创建/批量任务中）" />
             </MudCardContent>
             <MudCardActions>
                 <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
@@ -40,19 +42,32 @@
                         <MudTh>分类名称</MudTh>
                         <MudTh>颜色</MudTh>
                         <MudTh>描述</MudTh>
+                        <MudTh>排除操作</MudTh>
                         <MudTh>账号数量</MudTh>
                         <MudTh>操作</MudTh>
                     </HeaderContent>
                     <RowTemplate>
                         <MudTd DataLabel="分类名称">
-                            <MudChip T="string" Style="@($"background-color: {context.Color ?? "#9E9E9E"}")">@context.Name</MudChip>
+                            <MudChip T="string" Style="@($"color: {context.Color ?? "#9E9E9E"}; border: 1px solid {context.Color ?? "#9E9E9E"}; background-color: transparent;")">@context.Name</MudChip>
                         </MudTd>
                         <MudTd DataLabel="颜色">
-                            <div style="@($"width: 30px; height: 30px; background-color: {context.Color ?? "#9E9E9E"}; border-radius: 4px;")"></div>
+                            <div style="@($"width: 30px; height: 30px; color: {context.Color ?? "#9E9E9E"}; border: 1px solid {context.Color ?? "#9E9E9E"}; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; background-color: transparent;")">A</div>
                         </MudTd>
                         <MudTd DataLabel="描述">@(context.Description ?? "-")</MudTd>
+                        <MudTd DataLabel="排除操作">
+                            @if (context.ExcludeFromOperations)
+                            {
+                                <MudChip T="string" Size="Size.Small" Color="Color.Warning">是</MudChip>
+                            }
+                            else
+                            {
+                                <span>-</span>
+                            }
+                        </MudTd>
                         <MudTd DataLabel="账号数量">@context.Accounts.Count</MudTd>
                         <MudTd DataLabel="操作">
+                            <MudIconButton Icon="@Icons.Material.Filled.Edit" Size="Size.Small" Color="Color.Primary"
+                                           OnClick="@(() => EditCategory(context))" />
                             <MudIconButton Icon="@Icons.Material.Filled.Delete" Size="Size.Small" Color="Color.Error"
                                            OnClick="@(() => DeleteCategory(context))" />
                         </MudTd>
@@ -113,6 +128,7 @@
     private string newCategoryName = "";
     private MudColor newCategoryColor = "#1976d2";
     private string newCategoryDesc = "";
+    private bool newCategoryExcludeFromOperations;
     private List<AccountCategory> categories = new();
     private bool loading = true;
 
@@ -213,6 +229,7 @@
                 Name = newCategoryName,
                 Color = newCategoryColor.Value,
                 Description = newCategoryDesc,
+                ExcludeFromOperations = newCategoryExcludeFromOperations,
                 CreatedAt = DateTime.UtcNow
             };
 
@@ -224,6 +241,7 @@
             newCategoryName = "";
             newCategoryColor = "#1976d2";
             newCategoryDesc = "";
+            newCategoryExcludeFromOperations = false;
         }
         catch (Exception ex)
         {
@@ -256,6 +274,48 @@
             {
                 Snackbar.Add($"删除失败：{ex.Message}", Severity.Error);
             }
+        }
+    }
+
+    private async Task EditCategory(AccountCategory category)
+    {
+        if (category == null)
+            return;
+
+        var parameters = new DialogParameters
+        {
+            ["Category"] = category
+        };
+        var options = new DialogOptions { CloseOnEscapeKey = true, MaxWidth = MaxWidth.Small, FullWidth = true };
+        var dialog = DialogService.Show<TelegramPanel.Web.Components.Dialogs.AccountCategoryEditDialog>("编辑分类", parameters, options)!;
+        var result = await dialog.Result;
+        if (result is not { Canceled: false })
+            return;
+
+        if (result.Data is not TelegramPanel.Web.Components.Dialogs.AccountCategoryEditModel model)
+            return;
+
+        if (string.IsNullOrWhiteSpace(model.Name))
+        {
+            Snackbar.Add("分类名称不能为空", Severity.Error);
+            return;
+        }
+
+        try
+        {
+            category.Name = model.Name.Trim();
+            category.Color = model.Color;
+            category.Description = model.Description;
+            category.ExcludeFromOperations = model.ExcludeFromOperations;
+
+            await CategoryManagement.UpdateCategoryAsync(category);
+            await LoadCategories();
+            await LoadAccounts();
+            Snackbar.Add("分类已更新", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"更新失败：{ex.Message}", Severity.Error);
         }
     }
 }

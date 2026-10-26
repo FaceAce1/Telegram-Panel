@@ -1,0 +1,401 @@
+using Microsoft.Data.Sqlite;
+using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging.Abstractions;
+using TelegramPanel.Core.Interfaces;
+using TelegramPanel.Core.Models;
+using TelegramPanel.Core.Services.Proxy;
+using TelegramPanel.Data;
+using TelegramPanel.Data.Entities;
+using TelegramPanel.Data.Repositories;
+using TelegramPanel.Web.Api;
+using WTelegram;
+using Xunit;
+
+namespace TelegramPanel.Web.Tests;
+
+public sealed class ManagedWgcfProxyGuardTests
+{
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task 代理重命名只修改名称并保留绑定连接材料和检测结果(bool managed)
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        if (!managed)
+        {
+            proxy.ManagedWgcfProfile = null;
+            proxy.Kind = "manual";
+            await f.Db.SaveChangesAsync();
+        }
+        await f.AccountAsync("1", proxy);
+        f.Configuration["Telegram:Proxy:Enabled"] = "true";
+        f.Configuration["Telegram:Proxy:SourceMode"] = "existing";
+        f.Configuration["Telegram:Proxy:ProxyId"] = proxy.Id.ToString();
+        var before = f.Db.Entry(proxy).Properties
+            .Where(p => p.Metadata.Name is not ("Name" or "UpdatedAtUtc"))
+            .ToDictionary(p => p.Metadata.Name, p => p.CurrentValue);
+
+        var result = await ProxyApiEndpoints.RenameAsync(proxy.Id, new("  新的出口名称  "), f.Service, default);
+
+        Assert.Equal(StatusCodes.Status200OK, Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode);
+        Assert.True(Assert.IsType<OperationResultDto>(Assert.IsAssignableFrom<IValueHttpResult>(result).Value).Success);
+        await f.Db.Entry(proxy).ReloadAsync();
+        Assert.Equal("新的出口名称", proxy.Name);
+        foreach (var property in before)
+            Assert.Equal(property.Value, f.Db.Entry(proxy).Property(property.Key).CurrentValue);
+        var account = await f.Db.Accounts.AsNoTracking().SingleAsync();
+        Assert.Equal(proxy.Id, account.ProxyId);
+        Assert.True(account.IsActive);
+        Assert.Equal(proxy.Id, f.Service.GetEnabledGlobalProxyId());
+        if (managed)
+        {
+            var recreated = await f.Service.CreateManagedWgcfProxyAsync("profile-one", "旧档案名称", 18081, "user", "secret");
+            Assert.Equal("新的出口名称", recreated.Name);
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("too-long")]
+    public async Task 重命名拒绝空名称和超长名称且不写入(string? name)
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        var result = await ProxyApiEndpoints.RenameAsync(proxy.Id,
+            new(name == "too-long" ? new string('名', 81) : name), f.Service, default);
+        Assert.Equal(StatusCodes.Status400BadRequest, Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode);
+        Assert.Equal("managed", (await f.Db.OutboundProxies.AsNoTracking().SingleAsync()).Name);
+    }
+
+    [Fact]
+    public async Task 重命名支持八十字符且不存在的代理返回四零四()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        var name = new string('名', 80);
+        await f.Service.RenameAsync(proxy.Id, "  " + name + "  ");
+        Assert.Equal(name, (await f.Db.OutboundProxies.AsNoTracking().SingleAsync()).Name);
+        var result = await ProxyApiEndpoints.RenameAsync(proxy.Id + 1, new("不存在"), f.Service, default);
+        Assert.Equal(StatusCodes.Status404NotFound, Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode);
+    }
+
+    [Fact]
+    public async Task 受管出口允许显式多人绑定且保留激活状态()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        var first = await f.AccountAsync("1");
+        var second = await f.AccountAsync("2");
+        await f.Service.BindAccountsAsync(
+            new[] { first.Id, second.Id }, new("existing", proxy.Id));
+        Assert.All(await f.Db.Accounts.AsNoTracking().ToListAsync(), a =>
+        {
+            Assert.Equal(proxy.Id, a.ProxyId);
+            Assert.True(a.IsActive);
+            Assert.False(a.UseGlobalProxy);
+        });
+    }
+
+    [Fact]
+    public async Task 已有所有者的受管出口允许第二账号且保留第一绑定()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        var first = await f.AccountAsync("1", proxy);
+        var second = await f.AccountAsync("2");
+        await f.Service.BindAccountsAsync(new[] { second.Id }, new("existing", proxy.Id));
+        Assert.Equal(proxy.Id, (await f.Db.Accounts.AsNoTracking().SingleAsync(a => a.Id == first.Id)).ProxyId);
+        Assert.Equal(proxy.Id, (await f.Db.Accounts.AsNoTracking().SingleAsync(a => a.Id == second.Id)).ProxyId);
+    }
+
+    [Fact]
+    public async Task 受管出口允许全局已有代理选择且保存全程持有占用()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        var saved = false;
+        await f.Service.ExecuteGlobalProxyChangeAsync(
+            true, "existing", proxy.Id, _ =>
+            {
+                Assert.True(f.Claims.IsManagedProfileClaimed(proxy.ManagedWgcfProfile!));
+                saved = true;
+                return Task.CompletedTask;
+            });
+        Assert.True(saved);
+        Assert.False(f.Claims.IsManagedProfileClaimed(proxy.ManagedWgcfProfile!));
+    }
+
+    [Fact]
+    public async Task 受管出口允许作为导入登录首次连接的已有代理()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        await f.Service.ValidateBindingInputAsync(new("existing", proxy.Id));
+    }
+
+    [Fact]
+    public async Task 全局共享保存异常释放本次占用且活跃首连不能被改写()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        await Assert.ThrowsAsync<IOException>(() => f.Service.ExecuteGlobalProxyChangeAsync(
+            true, "existing", proxy.Id, _ => throw new IOException("模拟保存失败")));
+        Assert.False(f.Claims.IsManagedProfileClaimed(proxy.ManagedWgcfProfile!));
+        using var owner = f.Claims.ClaimManagedProfile(proxy.ManagedWgcfProfile!);
+        var saved = false;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.ExecuteGlobalProxyChangeAsync(
+            true, "existing", proxy.Id, _ => { saved = true; return Task.CompletedTask; }));
+        Assert.False(saved);
+        Assert.True(f.Claims.OwnsManagedProfile(proxy.ManagedWgcfProfile!, owner.Token));
+    }
+
+    [Fact]
+    public async Task 轻量出口被设为全局后不能停用()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        await f.Service.ExecuteGlobalProxyChangeAsync(true, "existing", proxy.Id, _ =>
+        {
+            f.Configuration["Telegram:Proxy:Enabled"] = "true";
+            f.Configuration["Telegram:Proxy:SourceMode"] = "existing";
+            f.Configuration["Telegram:Proxy:ProxyId"] = proxy.Id.ToString();
+            return Task.CompletedTask;
+        });
+        await Assert.ThrowsAsync<ProxyInUseException>(() => f.Service.SetManagedWgcfEnabledAsync(proxy.ManagedWgcfProfile!, false));
+        Assert.True((await f.Db.OutboundProxies.SingleAsync()).IsEnabled);
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1")]
+    [InlineData("localhost")]
+    [InlineData("::1")]
+    public async Task 普通创建和逐账号导入不能克隆受管监听端口(string host)
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.CreateAsync(Input(host, proxy.Port)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.PrepareAccountProxyAssignmentsAsync(
+            $"socks5://shadow:secret@{(host.Contains(':') ? $"[{host}]" : host)}:{proxy.Port}", 1));
+        Assert.Single(await f.Db.OutboundProxies.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task 普通修改删除和仓储捷径不能变更受管出口()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        var account = await f.AccountAsync("1");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.UpdateAsync(proxy.Id, Input("127.0.0.1", proxy.Port)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.DeleteAsync(proxy.Id));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new OutboundProxyRepository(f.Db).BindAccountsAsync(
+            new[] { account.Id }, proxy.Id));
+        Assert.Single(await f.Db.OutboundProxies.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task 全局配置可以引用受管出口但禁止手工克隆监听端点()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        f.Configuration["Telegram:Proxy:Enabled"] = "true";
+        f.Configuration["Telegram:Proxy:SourceMode"] = "existing";
+        f.Configuration["Telegram:Proxy:ProxyId"] = proxy.Id.ToString();
+        Assert.Equal(proxy.Id, (await new GlobalProxyResolver(f.Db, f.Configuration).ResolveAsync("account"))!.ProxyId);
+        f.Configuration["Telegram:Proxy:SourceMode"] = "manual";
+        f.Configuration["Telegram:Proxy:Server"] = "localhost";
+        f.Configuration["Telegram:Proxy:Port"] = proxy.Port.ToString();
+        f.Configuration["Telegram:Proxy:Protocol"] = "socks5";
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new GlobalProxyResolver(f.Db, f.Configuration).ResolveAsync("account"));
+    }
+
+    [Fact]
+    public async Task 专用创建幂等且启停不允许跳过占用检查()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var first = await f.Service.CreateManagedWgcfProxyAsync("profile-one", "managed", 18081, "user", "secret");
+        var same = await f.Service.CreateManagedWgcfProxyAsync("profile-one", "ignored", 18081, "user", "secret");
+        Assert.Equal(first.Id, same.Id);
+        var account = await f.AccountAsync("1", first);
+        await Assert.ThrowsAsync<ProxyInUseException>(() => f.Service.SetManagedWgcfEnabledAsync("profile-one", false));
+        Assert.True((await f.Db.OutboundProxies.AsNoTracking().SingleAsync()).IsEnabled);
+        f.Db.Accounts.Remove(account);
+        await f.Db.SaveChangesAsync();
+        var stopped = await f.Service.SetManagedWgcfEnabledAsync("profile-one", false);
+        Assert.False(stopped.IsEnabled);
+        Assert.Equal("unknown", stopped.TestStatus);
+        var resumed = await f.Service.SetManagedWgcfEnabledAsync("profile-one", true);
+        Assert.True(resumed.IsEnabled);
+        Assert.Equal("unknown", resumed.TestStatus);
+    }
+
+    [Fact]
+    public async Task CAS同时检查旧代理和全局模式()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var managed = await f.ManagedAsync();
+        var account = await f.AccountAsync("1");
+        await Assert.ThrowsAsync<ProxyBindingConflictException>(() => f.Service.BindAccountsAsync(
+            new[] { account.Id }, new("existing", managed.Id, 0, null, false)));
+        var unchanged = await f.Db.Accounts.AsNoTracking().SingleAsync();
+        Assert.True(unchanged.UseGlobalProxy);
+        Assert.Null(unchanged.ProxyId);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task 专用启停落库全程阻止首次连接Acquire且完成后释放占用(bool enabled)
+    {
+        var saving = new BlockingSaveInterceptor();
+        await using var f = await Fixture.CreateAsync(saving);
+        var proxy = await f.ManagedAsync();
+        proxy.IsEnabled = !enabled;
+        await f.Db.SaveChangesAsync();
+        saving.Enabled = true;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var mutation = f.Service.SetManagedWgcfEnabledAsync(proxy.ManagedWgcfProfile!, enabled, timeout.Token);
+        try
+        {
+            await saving.Entered.Task.WaitAsync(timeout.Token);
+            Assert.True(f.Claims.IsManagedProfileClaimed(proxy.ManagedWgcfProfile!));
+            await using var competingDb = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(f.Db.Database.GetDbConnection()).Options);
+            var provisioner = new FakeManagedWarpProvisioner(competingDb, f.Claims);
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.AcquireAsync(proxy.Id, timeout.Token));
+            Assert.Contains("占用", error.Message);
+        }
+        finally
+        {
+            saving.Continue.TrySetResult();
+            await mutation;
+        }
+        Assert.False(f.Claims.IsManagedProfileClaimed(proxy.ManagedWgcfProfile!));
+        Assert.Equal(enabled, (await f.Db.OutboundProxies.AsNoTracking().SingleAsync()).IsEnabled);
+    }
+
+    [Fact]
+    public async Task 专用启停沿用内部租约且不会释放调用方占用()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var proxy = await f.ManagedAsync();
+        using var owner = f.Claims.ClaimManagedProfile(proxy.ManagedWgcfProfile!);
+        await f.Service.SetManagedWgcfEnabledAsync(proxy.ManagedWgcfProfile!, false, claimToken: owner.Token);
+        Assert.True(f.Claims.OwnsManagedProfile(proxy.ManagedWgcfProfile!, owner.Token));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.SetManagedWgcfEnabledAsync(
+            proxy.ManagedWgcfProfile!, true, claimToken: "other"));
+        Assert.False((await f.Db.OutboundProxies.AsNoTracking().SingleAsync()).IsEnabled);
+        Assert.True(f.Claims.OwnsManagedProfile(proxy.ManagedWgcfProfile!, owner.Token));
+    }
+
+    [Fact]
+    public async Task 专用启停落库异常后释放本次占用()
+    {
+        var saving = new BlockingSaveInterceptor();
+        await using var f = await Fixture.CreateAsync(saving);
+        var proxy = await f.ManagedAsync();
+        saving.Enabled = true;
+        saving.ThrowOnSave = true;
+        saving.Continue.TrySetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Service.SetManagedWgcfEnabledAsync(proxy.ManagedWgcfProfile!, false));
+        Assert.False(f.Claims.IsManagedProfileClaimed(proxy.ManagedWgcfProfile!));
+    }
+
+    private static OutboundProxyInput Input(string host, int port) => new(
+        "shadow", "manual", "socks5", host, port, "shadow", "secret", null, null, null, null);
+
+    private sealed class Fixture : IAsyncDisposable
+    {
+        private readonly SqliteConnection _connection;
+        public AppDbContext Db { get; }
+        public IConfiguration Configuration { get; }
+        public ProxyManagementService Service { get; }
+        public TemporaryWarpClaimStore Claims { get; } = new();
+        private Fixture(SqliteConnection connection, AppDbContext db)
+        {
+            _connection = connection;
+            Db = db;
+            Configuration = new ConfigurationBuilder().AddInMemoryCollection().Build();
+            var probe = new Probe();
+            Service = new(db, new EmptyPool(), probe,
+                NullLogger<ProxyManagementService>.Instance, Configuration, temporaryWarpClaims: Claims);
+        }
+        public static async Task<Fixture> CreateAsync(SaveChangesInterceptor? interceptor = null)
+        {
+            var connection = new SqliteConnection("Data Source=:memory:");
+            await connection.OpenAsync();
+            var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(connection);
+            if (interceptor != null) options.AddInterceptors(interceptor);
+            var db = new AppDbContext(options.Options);
+            await db.Database.EnsureCreatedAsync();
+            return new(connection, db);
+        }
+        public async Task<OutboundProxy> ManagedAsync()
+        {
+            var proxy = new OutboundProxy
+            {
+                Name = "managed", Kind = "wireguard_warp", ManagedWgcfProfile = "profile-one",
+                Protocol = "socks5", Host = "127.0.0.1", Port = 18081, Username = "user", Password = "secret",
+                IsEnabled = true, TestStatus = "ok", EgressIp = "203.0.113.2"
+            };
+            Db.Add(proxy);
+            await Db.SaveChangesAsync();
+            return proxy;
+        }
+        public async Task<Account> AccountAsync(string suffix, OutboundProxy? proxy = null)
+        {
+            var account = new Account
+            {
+                Phone = "861380000000" + suffix, UserId = int.Parse(suffix), SessionPath = "sessions/test" + suffix,
+                ApiId = 1, ApiHash = "hash", IsActive = true, UseGlobalProxy = proxy == null, Proxy = proxy
+            };
+            Db.Add(account);
+            await Db.SaveChangesAsync();
+            return account;
+        }
+        public async ValueTask DisposeAsync()
+        {
+            await Db.DisposeAsync();
+            await _connection.DisposeAsync();
+        }
+    }
+    private sealed class BlockingSaveInterceptor : SaveChangesInterceptor
+    {
+        public bool Enabled { get; set; }
+        public bool ThrowOnSave { get; set; }
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Continue { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (!Enabled) return result;
+            Entered.TrySetResult();
+            await Continue.Task.WaitAsync(cancellationToken);
+            if (ThrowOnSave) throw new InvalidOperationException("模拟启停落库失败");
+            return result;
+        }
+    }
+    private sealed class Probe : IProxyEgressProbeService
+    {
+        private static Task<EgressProbeResult> Success() => Task.FromResult(new EgressProbeResult(
+            true, "203.0.113.2", "SG", "Singapore", "Cloudflare", "on", 1, DateTime.UtcNow, null));
+        public Task<EgressProbeResult> ProbePanelAsync(CancellationToken cancellationToken = default) => Success();
+        public Task<EgressProbeResult> ProbeProxyAsync(OutboundProxy proxy, string stableAccountKey, CancellationToken cancellationToken = default) => Success();
+        public Task<EgressProbeResult> ProbeProxyAsync(ProxyConnectionOptions options, bool requireWarp = false, CancellationToken cancellationToken = default) => Success();
+    }
+    private sealed class EmptyPool : ITelegramClientPool
+    {
+        public int ActiveClientCount => 0;
+        public Task<Client> GetOrCreateClientAsync(int accountId, int apiId, string apiHash, string sessionPath,
+            string? sessionKey = null, string? phoneNumber = null, long? userId = null) => throw new NotSupportedException();
+        public Client? GetClient(int accountId) => null;
+        public Task RemoveClientAsync(int accountId) => Task.CompletedTask;
+        public Task RemoveAllClientsAsync() => Task.CompletedTask;
+        public bool IsClientConnected(int accountId) => false;
+    }
+}
